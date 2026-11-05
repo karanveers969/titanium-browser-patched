@@ -1,0 +1,154 @@
+name: Build patched Titanium
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this version was already built"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  FORCE: ${{ inputs.force }}
+  APP_REPO: jqssun/android-titanium-browser
+  APP_PACKAGE: io.github.jqssun.helium
+  PATCHES_REPO: dh6k/morphe-patches
+  CLI_REPO: MorpheApp/morphe-desktop
+  PATCH_1: "Keep Titanium Extensions Child Processes Alive"
+  PATCH_2: "Force highest refresh rate"
+  ARCH_HINT: "arm64"
+  KS_PASS: "titanium"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Check for new versions
+        run: |
+          set -euo pipefail
+          app_tag=$(gh release view --repo "$APP_REPO" --json tagName -q .tagName)
+          patches_tag=$(gh release view --repo "$PATCHES_REPO" --json tagName -q .tagName)
+          tag="titanium-${app_tag}-patches-${patches_tag}"
+          {
+            echo "APP_TAG=$app_tag"
+            echo "PATCHES_TAG=$patches_tag"
+            echo "RELEASE_TAG=$tag"
+            echo "OUT=titanium-${app_tag}-patched.apk"
+          } >> "$GITHUB_ENV"
+          echo "Titanium: $app_tag | Patches: $patches_tag"
+          if gh release view "$tag" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
+            echo "Already built $tag. Nothing to do."
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download Titanium, patches and Morphe CLI
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          names=$(gh release view "$APP_TAG" --repo "$APP_REPO" --json assets -q '.assets[].name')
+          echo "Files in the Titanium release:"; echo "$names"
+          apks=$(printf '%s\n' "$names" | grep -iE '\.apk$' || true)
+          pick=$(printf '%s\n' "$apks" | grep -i "$ARCH_HINT" | grep -viE 'x86|v7a|armeabi' | head -n1 || true)
+          if [ -z "$pick" ]; then pick=$(printf '%s\n' "$apks" | grep -i universal | head -n1 || true); fi
+          if [ -z "$pick" ] && [ "$(printf '%s\n' "$apks" | grep -c .)" -eq 1 ]; then pick="$apks"; fi
+          if [ -z "$pick" ]; then
+            echo "ERROR: could not choose which APK to use. Set ARCH_HINT at the top of this file."
+            exit 1
+          fi
+          echo "Using: $pick"
+          gh release download "$APP_TAG" --repo "$APP_REPO" --pattern "$pick" --output stock.apk
+          gh release download "$PATCHES_TAG" --repo "$PATCHES_REPO" --pattern '*.mpp' --output patches.mpp
+          gh release download --repo "$CLI_REPO" --pattern 'morphe-desktop-*-all.jar' --output morphe.jar
+          aapt2=$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n1 || true)
+          if [ -n "$aapt2" ]; then
+            pkg=$("$aapt2" dump packagename stock.apk)
+            echo "Package in APK: $pkg"
+            if [ "$pkg" != "$APP_PACKAGE" ]; then
+              echo "ERROR: expected $APP_PACKAGE but the APK is $pkg. The patches target $APP_PACKAGE."
+              exit 1
+            fi
+          fi
+
+      - name: Create signing key (first run only)
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f ks.p12 ]; then
+            keytool -genkeypair -keystore ks.p12 -storetype PKCS12 \
+              -storepass "$KS_PASS" -keypass "$KS_PASS" -alias titanium \
+              -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Titanium Patched"
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add ks.p12
+            git commit -m "Add signing key"
+            git push origin HEAD
+          fi
+
+      - name: Patch and sign
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          cd work
+          java -jar morphe.jar list-patches --patches patches.mpp --with-packages --include-experimental > list.txt 2>&1 || true
+          echo "--- patch list (first 80 lines) ---"; head -n 80 list.txt; echo "---"
+          run_patch() {
+            rm -f "$OUT"
+            java -jar morphe.jar patch -p patches.mpp --exclusive "$@" --force \
+              --keystore "$GITHUB_WORKSPACE/ks.p12" --keystore-password "$KS_PASS" \
+              --keystore-entry-alias titanium --keystore-entry-password "$KS_PASS" \
+              -o "$OUT" stock.apk
+          }
+          if ! run_patch -e "$PATCH_1" -e "$PATCH_2"; then
+            echo "Patching by name failed. Retrying by patch index for $APP_PACKAGE ..."
+            idx=$(awk -v pkg="$APP_PACKAGE" -v a="$PATCH_1" -v b="$PATCH_2" '
+              /^[[:space:]]*Index:/ { i=$2 }
+              /^[[:space:]]*Name:/  { n=$0; sub(/^[[:space:]]*Name:[[:space:]]*/, "", n) }
+              index($0, pkg) && (n==a || n==b) { print i }' list.txt | sort -un)
+            if [ "$(printf '%s\n' "$idx" | grep -c .)" -ne 2 ]; then
+              echo "ERROR: could not find both Titanium patches in the list above."
+              exit 1
+            fi
+            args=()
+            for i in $idx; do args+=(--ei "$i"); done
+            run_patch "${args[@]}"
+          fi
+          if [ ! -s "$OUT" ]; then echo "ERROR: no patched APK was produced."; exit 1; fi
+          ls -l "$OUT"
+
+      - name: Publish release
+        if: env.SKIP != 'true'
+        run: |
+          set -euo pipefail
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$RELEASE_TAG" "work/$OUT" \
+            --title "Titanium $APP_TAG (patches $PATCHES_TAG)" \
+            --notes "Stock app: $APP_REPO $APP_TAG. Patches: $PATCHES_REPO $PATCHES_TAG. Patches applied: $PATCH_1; $PATCH_2." \
+            --latest
+
+      # GitHub switches off scheduled workflows after 60 days with no repo activity.
+      - name: Keep schedule alive
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((45 * 86400)) ]; then
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep schedule alive"
+            git push origin HEAD
+          fi
